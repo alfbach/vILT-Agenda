@@ -98,44 +98,117 @@ function buildAttendeeTokenUrl(token) {
   return u.toString();
 }
 
+/**
+ * Accepts raw token, full URL, or hash fragment; strips zero-width chars.
+ */
+function sanitizeAgendaToken(raw) {
+  if (raw == null) return "";
+  let s = String(raw).trim().replace(/[\u200b-\u200d\ufeff]/g, "").trim();
+  const tFromQuery = (str) => {
+    const m = str.match(/[?&]t=([^&#'"\s]+)/i);
+    if (!m) return null;
+    try {
+      return decodeURIComponent(m[1].replace(/\+/g, "%20")).trim();
+    } catch {
+      return m[1].trim();
+    }
+  };
+  let fromHash = null;
+  const hashIdx = s.indexOf("#");
+  if (hashIdx >= 0) fromHash = tFromQuery(s.slice(hashIdx));
+  const fromAnywhere = tFromQuery(s);
+  return (fromHash || fromAnywhere || s).trim();
+}
+
 function replaceHashAttendeeOnly() {
   const u = new URL(window.location.href);
   u.hash = "#/attendee";
   history.replaceState(null, "", u.toString());
 }
 
+async function readJsonBinRecord(binId, withMasterKey) {
+  const headers = {};
+  if (withMasterKey && JSONBIN_MASTER_KEY) headers["X-Master-Key"] = JSONBIN_MASTER_KEY;
+  let res;
+  try {
+    res = await fetch(`https://api.jsonbin.io/v3/b/${encodeURIComponent(binId)}/latest`, {
+      method: "GET",
+      mode: "cors",
+      headers,
+    });
+  } catch {
+    throw new Error("Network error while loading the token (check connection / CORS).");
+  }
+  if (!res.ok) {
+    let msg = `Storage returned HTTP ${res.status}.`;
+    try {
+      const err = await res.json();
+      if (err?.message) msg = err.message;
+    } catch {
+      /* ignore */
+    }
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  if (data && data.record != null) return data.record;
+  if (data && typeof data === "object" && !("metadata" in data) && !("record" in data)) {
+    return data;
+  }
+  throw new Error("Empty or unexpected response from storage.");
+}
+
 /**
- * Load share payload: jsonbin when key is set, else localStorage for short local tokens.
+ * Load share payload: localStorage first, then jsonbin.io when a key is configured.
  */
-async function fetchPayloadForToken(token) {
-  const t = String(token).trim();
+async function fetchPayloadForToken(tokenRaw) {
+  const t = sanitizeAgendaToken(tokenRaw);
   if (!t) throw new Error("Missing token.");
   if (!/^[a-zA-Z0-9_-]+$/.test(t)) {
-    throw new Error("Invalid token characters.");
+    throw new Error("Invalid token — paste only the code, or the full attendee link.");
   }
-  if (JSONBIN_MASTER_KEY) {
-    const res = await fetch(`https://api.jsonbin.io/v3/b/${encodeURIComponent(t)}/latest`, {
-      headers: { "X-Master-Key": JSONBIN_MASTER_KEY },
-    });
-    if (res.ok) {
-      const data = await res.json();
-      if (data && data.record != null) return data.record;
-      throw new Error("Empty response from storage.");
+
+  const tryLocal = () => {
+    const keys = [LOCAL_AGENDA_TOKEN_PREFIX + t, LOCAL_AGENDA_TOKEN_PREFIX + t.toLowerCase()];
+    for (const k of keys) {
+      const raw = localStorage.getItem(k);
+      if (raw) {
+        try {
+          return JSON.parse(raw);
+        } catch {
+          throw new Error("Stored agenda data is corrupted.");
+        }
+      }
     }
-  }
-  const raw = localStorage.getItem(LOCAL_AGENDA_TOKEN_PREFIX + t);
-  if (raw) {
+    return null;
+  };
+
+  const local = tryLocal();
+  if (local) return local;
+
+  const isBinId = /^[a-f0-9]{24}$/i.test(t);
+  if (isBinId) {
     try {
-      return JSON.parse(raw);
-    } catch {
-      throw new Error("Stored agenda data is corrupted.");
+      return await readJsonBinRecord(t, false);
+    } catch (e1) {
+      if (JSONBIN_MASTER_KEY) {
+        try {
+          return await readJsonBinRecord(t, true);
+        } catch (e2) {
+          throw e2;
+        }
+      }
+      throw new Error(
+        e1 instanceof Error && e1.message
+          ? e1.message
+          : "Could not load this bin id. If the bin is private, add JSONBIN_MASTER_KEY to app.js (same jsonbin.io account that published)."
+      );
     }
   }
-  if (JSONBIN_MASTER_KEY) {
-    throw new Error("Unknown token or agenda not found.");
-  }
+
   throw new Error(
-    "Unknown token. Without cloud storage, tokens only exist in the presenter’s browser — use agenda.json or set JSONBIN_MASTER_KEY in app.js."
+    JSONBIN_MASTER_KEY
+      ? "Unknown token — not stored in this browser and not a valid 24-character bin id."
+      : "Unknown token. Codes from “Create token” exist only in that browser unless you use jsonbin.io (see JSONBIN_MASTER_KEY in app.js) or agenda.json."
   );
 }
 
@@ -161,14 +234,21 @@ async function applyAgendaFromTokenAfterImport() {
 
 async function publishShareToken(payload) {
   if (JSONBIN_MASTER_KEY) {
-    const res = await fetch("https://api.jsonbin.io/v3/b", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Master-Key": JSONBIN_MASTER_KEY,
-      },
-      body: JSON.stringify(payload),
-    });
+    let res;
+    try {
+      res = await fetch("https://api.jsonbin.io/v3/b", {
+        method: "POST",
+        mode: "cors",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Master-Key": JSONBIN_MASTER_KEY,
+          "X-Bin-Private": "false",
+        },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      throw new Error("Network error while publishing (check connection / CORS).");
+    }
     let data = {};
     try {
       data = await res.json();
@@ -178,8 +258,8 @@ async function publishShareToken(payload) {
     if (!res.ok) {
       throw new Error(data?.message || `Could not publish agenda (${res.status}).`);
     }
-    const id = data?.metadata?.id;
-    if (!id) throw new Error("Unexpected response from jsonbin.io.");
+    const id = data?.metadata?.id ?? data?.id;
+    if (!id) throw new Error("Unexpected response from jsonbin.io (no bin id).");
     return String(id);
   }
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
